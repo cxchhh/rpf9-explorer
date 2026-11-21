@@ -63,7 +63,7 @@ Drag with the left mouse button to orbit, drag with the right mouse button to pa
 
 Load the relevant texture pools if a model appears gray. The text below the preview reports missing materials, lower-resolution mip levels, and layered-material approximations. Layered materials show the first available supported color layer. Some distant models use their native vertex colors when they have no UV coordinates.
 
-Use **Scan entire archive** to rebuild a saved model index after a decoder update. Model recovery supports RPF9 resources with small uncompressed metadata or geometry tails alongside their zlib blocks.
+Use **Scan entire archive** to rebuild a saved model index after a decoder update. Model recovery supports RPF9 resources with small uncompressed metadata or geometry tails alongside their zlib blocks. Drawable dictionaries, such as map LOD tiles, load as one model: each drawable keeps its own local origin, so the parts overlap in the preview, and mesh names in the exported OBJ start with the drawable name.
 
 Some models still have missing or unsupported material bindings, even when the pools are loaded. Xbox BCPack decoding is unavailable. Full game shaders, palette effects, animation, and skeleton transforms are not reproduced.
 
