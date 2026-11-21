@@ -56,13 +56,22 @@ public static class RageModelDecoder
     public static bool LooksLikeFragment(ReadOnlySpan<byte> prefix)
     {
         if (prefix.Length < 176 || BinaryPrimitives.ReadUInt64LittleEndian(prefix) != 0) return false;
-        foreach (int at in new[] { 8, 16, 24, 32, 40, 168 })
+        // Page map, drawable and name are always set.
+        foreach (int at in new[] { 8, 24, 168 })
             if (!SystemPointer(BinaryPrimitives.ReadUInt64LittleEndian(prefix[at..]))) return false;
+        // +16, +32 and +40 are null together in fragments without the extra structures they point to.
+        foreach (int at in new[] { 16, 32, 40 })
+        {
+            ulong pointer = BinaryPrimitives.ReadUInt64LittleEndian(prefix[at..]);
+            if (pointer != 0 && !SystemPointer(pointer)) return false;
+        }
+        // The four 16-bit fields at +48 are not count/capacity pairs: +50 can exceed +48 and +54 is usually larger
+        // than +52. Only their ranges and the +52 <= +54 order hold for every fragment.
         ushort a = BinaryPrimitives.ReadUInt16LittleEndian(prefix[48..]);
-        ushort b = BinaryPrimitives.ReadUInt16LittleEndian(prefix[52..]);
-        return a is > 0 and <= 4096 && b is > 0 and <= 4096 &&
-            a == BinaryPrimitives.ReadUInt16LittleEndian(prefix[50..]) &&
-            b == BinaryPrimitives.ReadUInt16LittleEndian(prefix[54..]);
+        ushort b = BinaryPrimitives.ReadUInt16LittleEndian(prefix[50..]);
+        ushort c = BinaryPrimitives.ReadUInt16LittleEndian(prefix[52..]);
+        ushort d = BinaryPrimitives.ReadUInt16LittleEndian(prefix[54..]);
+        return a is > 0 and <= 4096 && b <= 4096 && c <= d && d <= 4096;
     }
 
     public static bool LooksLikeResource(ReadOnlySpan<byte> prefix) => LooksLikeDrawable(prefix) || LooksLikeFragment(prefix);
