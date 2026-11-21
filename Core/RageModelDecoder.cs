@@ -32,7 +32,13 @@ public sealed record RageModel(string Name, IReadOnlyList<RageMesh> Meshes, Vect
     public IReadOnlyList<RageMaterial>? Materials { get; init; }
     public IReadOnlyList<RageTextureInfo>? EmbeddedTextures { get; init; }
     public int? EmbeddedTextureDictionaryOffset { get; init; }
+    /// <summary>Set for drawable dictionaries: one entry per drawable, in dictionary order. Each drawable keeps its own
+    /// local origin; its meshes are <c>Meshes[FirstMesh..(FirstMesh + MeshCount)]</c>.</summary>
+    public IReadOnlyList<RageDrawableEntry>? DictionaryEntries { get; init; }
 }
+
+public sealed record RageDrawableEntry(string Name, uint NameHash, int DrawableOffset, int FirstMesh, int MeshCount,
+    Vector3 BoundsMin, Vector3 BoundsMax);
 
 public sealed record RageModelExtent(int RequiredSystemBytes, int RequiredGraphicsBytes,
     bool MetadataComplete, int DrawableOffset, bool IsFragment);
@@ -47,6 +53,7 @@ public static class RageModelDecoder
     public const int MaxSystemBytes = 32 * 1024 * 1024;
     public const int MaxGraphicsBytes = 224 * 1024 * 1024;
     private const int MaxMeshes = 1024;
+    private const int MaxDictionaryEntries = 1024;
     private const int MaxTotalVertices = 2_000_000;
     private const int MaxTotalTriangles = 2_000_000;
 
@@ -65,7 +72,34 @@ public static class RageModelDecoder
             b == BinaryPrimitives.ReadUInt16LittleEndian(prefix[54..]);
     }
 
-    public static bool LooksLikeResource(ReadOnlySpan<byte> prefix) => LooksLikeDrawable(prefix) || LooksLikeFragment(prefix);
+    /// <summary>Drawable dictionary header: page map at +8, no parent (+16), reference count 1 (+24), name hashes at +32
+    /// and drawables at +48, each followed by a matching 16-bit count/capacity pair. Texture dictionaries share this
+    /// header; the decoder tells them apart by the entries.</summary>
+    public static bool LooksLikeDrawableDictionary(ReadOnlySpan<byte> prefix)
+    {
+        if (prefix.Length < 64 || BinaryPrimitives.ReadUInt64LittleEndian(prefix) != 0 ||
+            BinaryPrimitives.ReadUInt64LittleEndian(prefix[16..]) != 0 || BinaryPrimitives.ReadUInt64LittleEndian(prefix[24..]) != 1)
+            return false;
+        foreach (int at in new[] { 8, 32, 48 })
+            if (!SystemPointer(BinaryPrimitives.ReadUInt64LittleEndian(prefix[at..]))) return false;
+        ushort count = BinaryPrimitives.ReadUInt16LittleEndian(prefix[40..]);
+        return count is > 0 and <= MaxDictionaryEntries && count == BinaryPrimitives.ReadUInt16LittleEndian(prefix[42..]) &&
+            count == BinaryPrimitives.ReadUInt16LittleEndian(prefix[56..]) && count == BinaryPrimitives.ReadUInt16LittleEndian(prefix[58..]);
+    }
+
+    public static bool LooksLikeResource(ReadOnlySpan<byte> prefix) =>
+        LooksLikeDrawable(prefix) || LooksLikeFragment(prefix) || LooksLikeDrawableDictionary(prefix);
+
+    // Jenkins one-at-a-time over the lower-cased name: the dictionary's key for each drawable.
+    private static uint NameHash(string name)
+    {
+        uint h = 0;
+        foreach (byte c in Encoding.UTF8.GetBytes(name.ToLowerInvariant())) { h += c; h += h << 10; h ^= h >> 6; }
+        h += h << 3; h ^= h >> 11; h += h << 15;
+        return h;
+    }
+
+    private static string DictionaryKey(string name) => name.EndsWith(".#dr", StringComparison.Ordinal) ? name[..^4] : name;
 
 
 
@@ -214,21 +248,44 @@ public static class RageModelDecoder
             int pages = S(8, 16), systemPages = sys[pages + 8], graphicsPages = sys[pages + 9];
             Check(systemPages is > 0 and <= 32 && graphicsPages is > 0 and <= 32);
             Cover(pages, checked(16 + 8 * (systemPages + graphicsPages)));
-            Fragment = !LooksLikeDrawable(sys);
-            if (Fragment)
+            if (LooksLikeDrawableDictionary(sys))
             {
-                Check(LooksLikeFragment(sys));
-                Name(168); Drawable = S(24, 176);
-                Check(Drawable != 0 && LooksLikeDrawableHeader(sys[Drawable..], true));
+                int count = U16(40), values = S(48, checked(count * 8));
+                S(32, checked(count * 4));
+                var seen = new HashSet<int>();
+                for (int i = 0; i < count; i++)
+                {
+                    int entry = S(values + i * 8, 176);
+                    Check(seen.Add(entry) && LooksLikeDrawableHeader(sys[entry..], true));
+                    if (i == 0) Drawable = entry;
+                    WalkDrawable(entry);
+                }
             }
-            if (U64(Drawable + 168) != 0) Name(Drawable + 168);
+            else
+            {
+                Fragment = !LooksLikeDrawable(sys);
+                if (Fragment)
+                {
+                    Check(LooksLikeFragment(sys));
+                    Name(168); Drawable = S(24, 176);
+                    Check(Drawable != 0 && LooksLikeDrawableHeader(sys[Drawable..], true));
+                }
+                WalkDrawable(Drawable);
+            }
+            Check(GraphicsEnd > 0);
+            return new(SystemEnd, GraphicsEnd, true, Drawable, Fragment);
+        }
+
+        private void WalkDrawable(int drawable)
+        {
+            if (U64(drawable + 168) != 0) Name(drawable + 168);
             // Four LOD slots (+80 high, then +88, +96, +104). The first is required; the others are walked when set,
             // so a drawable with lower LODs has all of its system and graphics data accounted for.
             var seenLods = new HashSet<int>();
             for (int slot = 80; slot <= 104; slot += 8)
             {
-                if (slot != 80 && U64(Drawable + slot) == 0) continue;
-                int lod = S(Drawable + slot, 16), models = U16(lod + 8);
+                if (slot != 80 && U64(drawable + slot) == 0) continue;
+                int lod = S(drawable + slot, 16), models = U16(lod + 8);
                 if (!seenLods.Add(lod)) continue;
                 Check(models is > 0 and <= 256 && models == U16(lod + 10));
                 int pointers = S(lod, models * 8);
@@ -259,20 +316,20 @@ public static class RageModelDecoder
                     }
                 }
             }
-            int shader = S(Drawable + 16, 64);
+            int shader = S(drawable + 16, 64);
             if (U64(shader + 48) != 0)
             {
                 int descriptor = S(shader + 48, 32);
                 Buffer(S(descriptor, 64));
             }
             if (U64(shader + 8) != 0) TextureDictionary(S(shader + 8, 64));
-            if (U64(Drawable + 176) != 0)
+            if (U64(drawable + 176) != 0)
             {
 
 
 
 
-                int renderer = S(Drawable + 176, 80);
+                int renderer = S(drawable + 176, 80);
                 for (int i = 0; i < 5; i++)
                 {
                     int list = renderer + i * 16, count = U16(list + 8);
@@ -280,8 +337,6 @@ public static class RageModelDecoder
                     if (count > 0) S(list, i < 4 ? checked(count * 4) : 1);
                 }
             }
-            Check(GraphicsEnd > 0);
-            return new(SystemEnd, GraphicsEnd, true, Drawable, Fragment);
         }
 
         private void TextureDictionary(int dictionary)
@@ -339,6 +394,7 @@ public static class RageModelDecoder
         {
             int pageInfo = S(8, 16);
             Require(sys[pageInfo + 8] is > 0 and <= 32 && sys[pageInfo + 9] is > 0 and <= 32);
+            if (LooksLikeDrawableDictionary(sys)) return DecodeDictionary();
             bool fragment = !LooksLikeDrawable(sys);
             int drawable = 0;
             string? parentName = null;
@@ -355,12 +411,29 @@ public static class RageModelDecoder
                 Require(name.EndsWith(".#ft", StringComparison.Ordinal) &&
                     string.Equals(name[..^4], parentName, StringComparison.Ordinal));
             Vector3 min = ReadVector(sys, drawable + 48), max = ReadVector(sys, drawable + 64);
-            int lod = S(drawable + 80, 16), modelCount = U16(sys, lod + 8), capacity = U16(sys, lod + 10);
-            Require(modelCount is > 0 and <= 256 && modelCount == capacity);
-            int list = S(lod, checked(modelCount * 8));
             var meshes = new List<RageMesh>();
             var materials = ReadMaterials(drawable);
             var embedded = ReadEmbeddedTextures(drawable);
+            ReadDrawableMeshes(drawable, meshes, materials?.Count, 0, "");
+            Require(meshes.Count > 0);
+            return new(name, meshes, min, max)
+            {
+                IsFragment = fragment, HasBoneBindings = hasBoneBindings, DrawableOffset = drawable,
+                Materials = materials,
+                EmbeddedTextures = embedded.Textures,
+                EmbeddedTextureDictionaryOffset = embedded.Offset,
+                PresentationNote = fragment
+                    ? "Raw bind-pose geometry; bone transforms, physics and fragment assembly are not applied."
+                    : hasBoneBindings ? "Raw bind-pose geometry; bone transforms are not applied." : null
+            };
+        }
+
+        // Meshes of the high LOD of one drawable. Shader indices are offset by materialBase into the model's material list.
+        private void ReadDrawableMeshes(int drawable, List<RageMesh> meshes, int? materialCount, int materialBase, string prefix)
+        {
+            int lod = S(drawable + 80, 16), modelCount = U16(sys, lod + 8), capacity = U16(sys, lod + 10);
+            Require(modelCount is > 0 and <= 256 && modelCount == capacity);
+            int list = S(lod, checked(modelCount * 8));
             var seenModels = new HashSet<int>();
             var seenGeometry = new HashSet<int>();
             for (int mi = 0; mi < modelCount; mi++)
@@ -373,7 +446,7 @@ public static class RageModelDecoder
                 Require(boneCount <= 4096);
                 hasBoneBindings |= boneCount > 0;
                 int geometries = S(model + 8, checked(count * 8));
-                int? shaderMapping = ReadShaderMapping(model, count, materials?.Count);
+                int? shaderMapping = ReadShaderMapping(model, count, materialCount);
                 int bounds = S(model + 24, checked((count + (count > 1 ? 1 : 0)) * 32));
                 for (int gi = 0; gi < count; gi++)
                 {
@@ -383,22 +456,50 @@ public static class RageModelDecoder
                     int bound = bounds + (gi + (count > 1 ? 1 : 0)) * 32;
                     Vector3 partMin = ReadVector(sys, bound), partMax = ReadVector(sys, bound + 16);
                     Require(ValidBounds(partMin, partMax));
-                    var mesh = ReadMesh(geometry, $"model_{mi}_geometry_{gi}", partMin, partMax, boneCount);
+                    var mesh = ReadMesh(geometry, $"{prefix}model_{mi}_geometry_{gi}", partMin, partMax, boneCount);
                     if (shaderMapping is int mapping)
-                        mesh = mesh with { ShaderIndex = U16(sys, mapping + gi * 2) };
+                        mesh = mesh with { ShaderIndex = materialBase + U16(sys, mapping + gi * 2) };
                     meshes.Add(mesh);
                 }
             }
-            Require(meshes.Count > 0);
-            return new(name, meshes, min, max)
+        }
+
+        private RageModel DecodeDictionary()
+        {
+            int count = U16(sys, 40);
+            Require(count is > 0 and <= MaxDictionaryEntries && count == U16(sys, 42) && count == U16(sys, 56) && count == U16(sys, 58));
+            int hashes = S(32, checked(count * 4)), values = S(48, checked(count * 8));
+            var meshes = new List<RageMesh>();
+            var materials = new List<RageMaterial>();
+            var entries = new List<RageDrawableEntry>(count);
+            var seen = new HashSet<int>();
+            Vector3 min = new(float.PositiveInfinity), max = new(float.NegativeInfinity);
+            uint previous = 0;
+            for (int i = 0; i < count; i++)
             {
-                IsFragment = fragment, HasBoneBindings = hasBoneBindings, DrawableOffset = drawable,
-                Materials = materials,
-                EmbeddedTextures = embedded.Textures,
-                EmbeddedTextureDictionaryOffset = embedded.Offset,
-                PresentationNote = fragment
-                    ? "Raw bind-pose geometry; bone transforms, physics and fragment assembly are not applied."
-                    : hasBoneBindings ? "Raw bind-pose geometry; bone transforms are not applied." : null
+                int drawable = S(values + i * 8, 176);
+                Require(seen.Add(drawable) && LooksLikeDrawableHeader(sys[drawable..], true));
+                // Keys are the hashes of the drawable names, in ascending order.
+                string name = ReadName(drawable + 168);
+                uint hash = U32(sys, hashes + i * 4);
+                Require(hash == NameHash(DictionaryKey(name)) && (i == 0 || hash > previous));
+                previous = hash;
+                var own = ReadMaterials(drawable);
+                int first = meshes.Count, materialBase = materials.Count;
+                ReadDrawableMeshes(drawable, meshes, own?.Count, materialBase, DictionaryKey(name) + "/");
+                if (own is not null)
+                    materials.AddRange(own.Select(m => m with { ShaderIndex = materialBase + m.ShaderIndex }));
+                Vector3 entryMin = ReadVector(sys, drawable + 48), entryMax = ReadVector(sys, drawable + 64);
+                min = Vector3.Min(min, entryMin); max = Vector3.Max(max, entryMax);
+                entries.Add(new(name, hash, drawable, first, meshes.Count - first, entryMin, entryMax));
+            }
+            Require(meshes.Count > 0);
+            return new(DictionaryKey(entries[0].Name), meshes, min, max)
+            {
+                HasBoneBindings = hasBoneBindings, DrawableOffset = entries[0].DrawableOffset,
+                Materials = materials.Count > 0 ? materials : null,
+                DictionaryEntries = entries,
+                PresentationNote = $"Drawable dictionary with {count} drawables. Each keeps its own local origin; mesh names start with the drawable name."
             };
         }
 
