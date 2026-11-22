@@ -14,6 +14,7 @@ public static class Rpf9ModelRecovery
     public const int MaxRecoveredModels = 4096;
     public const long DecodeBudget = 1024L * 1024 * 1024;
     private const int ScanBlock = 4 * 1024 * 1024;
+    private const int MaxDictionaryCheckBytes = 64 * 1024;
     private const int RawSystemTailBytes = 16;
     private const int RawGraphicsTailBytes = 48;
     private sealed record Block(long Offset, long Packed, byte[] Data, bool IsRaw = false);
@@ -242,7 +243,21 @@ public static class Rpf9ModelRecovery
             Span<byte> prefix = stackalloc byte[176];
             int read = 0;
             while (read < prefix.Length) { int n = zlib.Read(prefix[read..]); if (n == 0) return false; read += n; }
-            return fragmentsOnly ? RageModelDecoder.LooksLikeFragment(prefix) : RageModelDecoder.LooksLikeResource(prefix);
+            if (fragmentsOnly) return RageModelDecoder.LooksLikeFragment(prefix);
+            if (RageModelDecoder.LooksLikeDrawable(prefix) || RageModelDecoder.LooksLikeFragment(prefix)) return true;
+            // A dictionary is a model only when its first value is an embedded drawable (texture dictionaries share the
+            // header). Inflate far enough to see that value; past this limit the decoder checks the entries instead.
+            // Two steps at most: the value array, then the first value's header.
+            byte[] head = prefix.ToArray();
+            for (int needed = RageModelDecoder.DrawableDictionaryCheckBytes(head); needed > head.Length;
+                 needed = RageModelDecoder.DrawableDictionaryCheckBytes(head))
+            {
+                if (needed > MaxDictionaryCheckBytes) return true;
+                int have = head.Length;
+                Array.Resize(ref head, needed);
+                while (have < needed) { int n = zlib.Read(head, have, needed - have); if (n == 0) return true; have += n; }
+            }
+            return RageModelDecoder.LooksLikeDrawableDictionary(head);
         }
         catch (Exception ex) when (ex is InvalidDataException or IOException or ArgumentException) { return false; }
     }

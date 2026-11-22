@@ -35,24 +35,32 @@ Check(RageModelDecoder.Decode(unsorted.System, unsorted.Graphics) is null, "reje
 var notDrawable = MakeDictionary(sortedNames, sortedNames.Select(Hash).ToArray());
 BinaryPrimitives.WriteUInt64LittleEndian(notDrawable.System.AsSpan(notDrawable.FirstDrawable + 8), 0x50000200); // a page map: not embedded
 Check(RageModelDecoder.Decode(notDrawable.System, notDrawable.Graphics) is null, "rejects entries that are not embedded drawables");
+Check(!RageModelDecoder.LooksLikeDrawableDictionary(notDrawable.System), "a dictionary whose first value is not an embedded drawable (a texture dictionary) is not a model");
+Check(RageModelDecoder.DrawableDictionaryCheckBytes(good.System) == notDrawable.FirstDrawable + 176, "bytes needed to check the first value");
+Check(RageModelDecoder.LooksLikeDrawableDictionary(good.System.AsSpan(0, 176)), "header alone decides when the first value is beyond the prefix");
 var wrongCount = MakeDictionary(sortedNames, sortedNames.Select(Hash).ToArray());
 BinaryPrimitives.WriteUInt16LittleEndian(wrongCount.System.AsSpan(58), 3);
 Check(!RageModelDecoder.LooksLikeDrawableDictionary(wrongCount.System), "rejects mismatched count/capacity");
 
 var directory = Directory.CreateTempSubdirectory("rpf9-dictionary-test-");
 string path = Path.Combine(directory.FullName, "dictionary.rpf");
+void WriteArchive((byte[] System, byte[] Graphics, int FirstDrawable) fixture)
+{
+    using var file = File.Create(path);
+    var header = new byte[64]; "9FPR"u8.CopyTo(header); file.Write(header);
+    file.Position = CandidateOffset;
+    foreach (var segment in new[] { fixture.System, fixture.Graphics })
+    {
+        using (var z = new ZLibStream(file, CompressionLevel.Optimal, leaveOpen: true)) z.Write(segment);
+        file.Write(new byte[(int)((-file.Position) & 15)]);
+    }
+}
 try
 {
-    using (var file = File.Create(path))
-    {
-        var header = new byte[64]; "9FPR"u8.CopyTo(header); file.Write(header);
-        file.Position = CandidateOffset;
-        foreach (var segment in new[] { good.System, good.Graphics })
-        {
-            using (var z = new ZLibStream(file, CompressionLevel.Optimal, leaveOpen: true)) z.Write(segment);
-            file.Write(new byte[(int)((-file.Position) & 15)]);
-        }
-    }
+    // The first value sits beyond the 176 header bytes, so the scanner has to inflate further to see it.
+    WriteArchive(notDrawable);
+    Check(Rpf9ModelRecovery.FindCandidateOffsets(path).Count == 0, "the scanner skips a dictionary of non-drawables");
+    WriteArchive(good);
     var candidates = Rpf9ModelRecovery.FindCandidateOffsets(path);
     Check(candidates.SequenceEqual([CandidateOffset]), "the scanner finds the dictionary");
     var entry = Rpf9ModelRecovery.RecoverAtOffsets(path, new FileInfo(path).Length, candidates).Single();
